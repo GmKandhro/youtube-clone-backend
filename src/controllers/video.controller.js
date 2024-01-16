@@ -5,22 +5,95 @@ import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { uploadOnCloudinary } from "../utils/cloudinary.js";
+import {Like} from "../models/like.model.js";
+import {Comment} from "../models/comment.model.js";
 
 const getAllVideos = asyncHandler(async (req, res) => {
-  let { page = 1, limit = 10, query, sortBy, sortType, userId } = req.query;
+  // Destructuring to extract values from req.query
+  const { page = 1, limit = 10, query, sortBy, sortType, userId } = req.query;
 
-  const skip = (page - 1) * limit;
+  try {
+    // Initialize an empty array to store the aggregation pipeline stages
+    let pipeline = [];
 
-  const allVideos = await Video.aggregate([
-    {
-      $match: {
-        userId: new mongoose.Types.ObjectId(userId),
-      }
+    // If userId is provided, add a $match stage to filter videos by owner
+    if (userId) {
+      pipeline.push({
+        $match: { owner: new mongoose.Types.ObjectId(userId) },
+      });
     }
-  ]).skip(skip).limit(limit)
 
-  
-})
+    // If sortBy and sortType are provided, add a $sort stage to sort the videos
+    if (sortBy && sortType) {
+      const sortOptions = {};
+      sortOptions[sortBy] = sortType === "desc" ? -1 : 1;
+      pipeline.push({
+        $sort: sortOptions,
+      });
+    }
+
+    // Add $skip and $limit stages for pagination
+    pipeline.push(
+      {
+        $skip: (page - 1) * parseInt(limit),
+      },
+      {
+        $limit: parseInt(limit),
+      }
+    );
+
+    // Use $lookup to join with the "users" collection and fetch owner details
+    pipeline.push({
+      $lookup: {
+        from: "users",
+        localField: "owner",
+        foreignField: "_id",
+        as: "ownerDetails",
+      },
+    });
+
+    // Use $unwind to destructure the array created by $lookup
+    pipeline.push({
+      $unwind: "$ownerDetails",
+    });
+
+    // Use $project to shape the final output by selecting specific fields
+    pipeline.push({
+      $project: {
+        videoFile: 1,
+        thumbNail: 1,
+        title: 1,
+        duration: 1,
+        views: 1,
+        owner: {
+          _id: "$ownerDetails._id",
+          fullName: "$ownerDetails.fullName",
+          avatar: "$ownerDetails.avatar",
+        },
+      },
+    });
+
+    // Use the aggregation pipeline to fetch videos
+    const getVideos = await Video.aggregate(pipeline);
+
+    // Check if videos are found
+    if (!getVideos || getVideos.length === 0) {
+      return res.status(200).json(new ApiResponse(404, [], "No videos found"));
+    }
+
+    // Respond with the fetched videos
+    res.status(200).json(new ApiResponse(200, getVideos, "All videos fetched"));
+
+  } catch (error) {
+    // Handle errors and throw a custom ApiError
+    console.log("Error in GetAllVideos ::", error?.message);
+    throw new ApiError(
+      error.statusCode || 500,
+      error?.message || "Internal server error in getAll videos"
+    );
+  }
+});
+
 
 const publishAVideo = asyncHandler(async (req, res) => {
   // TODO: get video, upload to cloudinary, create video
@@ -35,8 +108,11 @@ const publishAVideo = asyncHandler(async (req, res) => {
     throw new ApiError(400, "All fields are required");
   }
 
-  let thumbnailUrl = await uploadOnCloudinary(req.files.thumbnail[0].path);
-  let videoFileUrl = await uploadOnCloudinary(req.files.videoFile[0].path);
+  if(!req.files.thumbnail || !req.files.videoFile){
+    throw new ApiError(400, "Video file and thumbnail are required");
+  }
+  let thumbnailUrl = await uploadOnCloudinary(req?.files?.thumbnail[0].path);
+  let videoFileUrl = await uploadOnCloudinary(req?.files?.videoFile[0].path);
 
   // console.log(req.files)
   if (!videoFileUrl || !thumbnailUrl) {
@@ -50,7 +126,7 @@ const publishAVideo = asyncHandler(async (req, res) => {
     thumbnail: thumbnailUrl.url,
     videoFile: videoFileUrl.url,
     duration: videoFileUrl.duration,
-    owner:req.user._id
+    owner: req.user._id
   });
   res.status(201).json(new ApiResponse(201, "Video created", video));
 });
@@ -58,10 +134,63 @@ const publishAVideo = asyncHandler(async (req, res) => {
 const getVideoById = asyncHandler(async (req, res) => {
   //TODO: get video by id
   const { videoId } = req.params;
-  const video = await Video.findById(videoId);
-  if (!video) {
-    throw new ApiError(404, "Video not found");
-  }
+  const video = await Video.aggregate([
+    {
+      $match: {
+        _id: new mongoose.Types.ObjectId(videoId),
+      },
+    },
+    {
+      $lookup: {
+        from: "users",
+        localField: "owner",
+        foreignField: "_id",
+        as: "owner",
+        pipeline: [
+          {
+            $project: {
+              username: 1,
+              avatar : 1,
+              fullname : 1
+            },
+          },
+        ],
+      },
+    },
+    {
+      $lookup: {
+        from: "likes",
+        localField: "_id",
+        foreignField: "video",
+        as: "likes"
+      }
+    },
+    {
+      $addFields: {
+        owner: {
+          $first : "$owner"
+        }, 
+        likes:{
+          $size : "$likes"
+        
+      },
+        views: {
+          $add: [1, "$views"]
+                  }
+    }}
+  ])
+
+  if(video.length > 0){
+    video = video[0];
+}
+
+await Video.findByIdAndUpdate(videoId, {
+    $set:{
+        views: video.views
+    }
+});
+
+
   res.status(200).json(new ApiResponse(200, "Video found", video));
 });
 
@@ -84,8 +213,10 @@ const deleteVideo = asyncHandler(async (req, res) => {
   //TODO: delete video
   const { videoId } = req.params;
   const video = await Video.findByIdAndDelete(videoId);
-  if (!video) {
-    throw new ApiError(404, "Video not found");
+  const comments = await Comment.deleteMany({ video: videoId });
+  const Likes = await Like.deleteMany({ video: videoId });
+  if (!video || !comments || !Likes) {
+    throw new ApiError(404, "Video , comments or likes not found");
   }
   res.status(200).json(new ApiResponse(200, "Video deleted"));
 });
